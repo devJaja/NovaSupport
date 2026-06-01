@@ -413,6 +413,45 @@ All errors return JSON with an \`error\` field and optional \`code\`:
   app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
   app.get("/docs.json", (req, res) => res.json(swaggerSpec));
 
+  // ── Stellar TOML (#514) ───────────────────────────────────────────────
+  // Must be registered before any other middleware that might intercept it.
+  // Required by Stellar wallets and federation resolvers.
+  // Spec: https://developers.stellar.org/docs/learn/encyclopedia/network-configuration/stellar-toml
+  let tomlCache: { body: string; expiresAt: number } | null = null;
+
+  app.get("/.well-known/stellar.toml", async (_req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "public, max-age=60");
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+
+    const now = Date.now();
+    if (tomlCache && now < tomlCache.expiresAt) {
+      return res.send(tomlCache.body);
+    }
+
+    try {
+      const profiles = await prisma.profile.findMany({
+        select: { walletAddress: true },
+      });
+
+      const accountLines = profiles
+        .map((p) => `[[ACCOUNTS]]\naddress = "${p.walletAddress}"`)
+        .join("\n\n");
+
+      const body = [
+        `NETWORK_PASSPHRASE="Test SDF Network ; September 2015"`,
+        `FEDERATION_SERVER="https://api.novasupport.xyz/federation"`,
+        ``,
+        accountLines || `# no accounts yet`,
+      ].join("\n");
+
+      tomlCache = { body, expiresAt: now + 60_000 };
+      return res.send(body);
+    } catch {
+      return res.status(500).send("# Internal server error");
+    }
+  });
+
   // In-memory challenge store (stateless with signed timestamp)
   const challenges = new Map<
     string,
@@ -3771,13 +3810,51 @@ All errors return JSON with an \`error\` field and optional \`code\`:
     const user = await prisma.user.findFirst({ where: { email: req.auth!.walletAddress } });
     if (!user) return sendError(res, 401, "User not found");
 
+    const { profileId } = req.query as { profileId?: string };
+
+    if (profileId) {
+      // Creator view — return drips for this profile if caller owns it
+      const profile = await prisma.profile.findUnique({ where: { id: profileId } });
+      if (!profile) return sendError(res, 404, "Profile not found");
+      if (profile.walletAddress !== req.auth!.walletAddress) return sendError(res, 403, "Forbidden");
+
+      const subscriptions = await prisma.recurringSupport.findMany({
+        where: { profileId, status: { not: "cancelled" } },
+        include: { supporter: { select: { email: true } } },
+        orderBy: { createdAt: "desc" },
+      });
+
+      return res.json(subscriptions.map((s) => ({
+        id: s.id,
+        supporterAddress: s.supporter.email,
+        amount: s.amount.toString(),
+        assetCode: s.assetCode,
+        frequency: s.frequency,
+        nextRunAt: s.nextRunAt,
+        status: s.status,
+        createdAt: s.createdAt,
+      })));
+    }
+
+    // Supporter view — return the authenticated user's own drip subscriptions
     const subscriptions = await prisma.recurringSupport.findMany({
       where: { supporterId: user.id, status: { not: "cancelled" } },
       include: { profile: { select: { username: true, displayName: true } } },
       orderBy: { createdAt: "desc" },
     });
 
-    return res.json(subscriptions);
+    return res.json(subscriptions.map((s) => ({
+      id: s.id,
+      profileId: s.profileId,
+      profileUsername: s.profile.username,
+      profileDisplayName: s.profile.displayName,
+      amount: s.amount.toString(),
+      assetCode: s.assetCode,
+      frequency: s.frequency,
+      nextRunAt: s.nextRunAt,
+      status: s.status,
+      createdAt: s.createdAt,
+    })));
   });
 
   const patchRecurringSupportSchema = z.object({
